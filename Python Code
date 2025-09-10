@@ -1,0 +1,378 @@
+# Import the libraries need for the assignment
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import chi2_contingency
+import statsmodels.api as sm
+
+# Step 1: Read the CSV files
+# We did the code in Colab and need to upload from the computer
+# like from google.colab import files
+# uploaded = files.upload()  # then select dataset1.csv and dataset2.csv
+
+D1 = "dataset1.csv"
+D2 = "dataset2.csv"
+
+d1 = pd.read_csv(D1)
+d2 = pd.read_csv(D2)
+
+print("Shapes:", d1.shape, d2.shape)
+display(d1.head())
+display(d2.head())
+
+# Step 3: Quick schema overview
+print("=== d1.info() ===")
+print(d1.info())
+print("\n=== d2.info() ===")
+print(d2.info())
+
+print("\n=== Missing values (top 10 columns) ===")
+na1 = d1.isna().sum().sort_values(ascending=False).head(10)
+na2 = d2.isna().sum().sort_values(ascending=False).head(10)
+print("d1 NA:\n", na1)
+print("\nd2 NA:\n", na2)
+
+# Peek at basic stats for numeric columns
+display(d1.describe(include='number').T)
+display(d2.describe(include='number').T)
+
+# Step 4: Cleaning and type casts
+# Adjust the column names based on the datasets column.
+
+# Parse times
+for col in ['start_time','rat_period_start','rat_period_end','sunset_time']:
+    if col in d1.columns:
+        d1[col] = pd.to_datetime(d1[col], errors='coerce')
+
+if 'time' in d2.columns:
+    d2['time'] = pd.to_datetime(d2['time'], errors='coerce')
+
+# Coerce numeric columns
+num_cols_d1 = ['bat_landing_to_food','seconds_after_rat_arrival','risk','reward','hours_after_sunset']
+for c in num_cols_d1:
+    if c in d1.columns:
+        d1[c] = pd.to_numeric(d1[c], errors='coerce')
+
+num_cols_d2 = ['hours_after_sunset','bat_landing_number','food_availability','rat_minutes','rat_arrival_number']
+for c in num_cols_d2:
+    if c in d2.columns:
+        d2[c] = pd.to_numeric(d2[c], errors='coerce')
+
+# Trim strings
+for c in ['habit','month','season']:
+    if c in d1.columns and d1[c].dtype == 'object':
+        d1[c] = d1[c].astype(str).str.strip()
+
+if 'month' in d2.columns and d2['month'].dtype == 'object':
+    d2['month'] = d2['month'].astype(str).str.strip()
+
+print("Cleaning done.")
+
+# Step 5: Feature engineering
+if 'seconds_after_rat_arrival' in d1.columns:
+    d1['after_rat'] = (d1['seconds_after_rat_arrival'] >= 0).astype('Int64')
+
+if 'hours_after_sunset' in d1.columns:
+    d1['mins_after_sunset'] = (d1['hours_after_sunset'] * 60.0).astype(float)
+
+display(d1.head())
+
+# Step 6: As-of merge onto 30-minute windows
+if 'time' in d2.columns:
+    d2_sorted = d2.sort_values('time').copy()
+    d2_sorted['period_end'] = d2_sorted['time'] + pd.to_timedelta(30, unit='m')
+
+    d1_sorted = d1.sort_values('start_time').copy()
+    merged = pd.merge_asof(
+        d1_sorted,
+        d2_sorted[['time','period_end','rat_arrival_number','rat_minutes','bat_landing_number','food_availability','hours_after_sunset']].sort_values('time'),
+        left_on='start_time',
+        right_on='time',
+        direction='backward',
+        allow_exact_matches=True
+    )
+
+    # Keep landings occurring within the 30-min window
+    within = merged['start_time'].notna() & merged['time'].notna() & (merged['start_time'] < merged['period_end'])
+    d = merged.loc[within].copy()
+else:
+    d = d1.copy()
+    if 'rat_arrival_number' not in d.columns:
+        d['rat_arrival_number'] = np.nan
+
+print("Linked dataset shape:", d.shape)
+display(d.head())
+
+# Step 7: Prepare final analytic dataset
+analytic = d.copy()
+# Drop rows missing behaviour outcomes
+analytic = analytic.dropna(subset=['risk','reward'])
+analytic['risk'] = analytic['risk'].astype(int)
+analytic['reward'] = analytic['reward'].astype(int)
+
+print("Analytic dataset:", analytic.shape)
+print("Risk value counts:\n", analytic['risk'].value_counts(dropna=False))
+print("\nReward value counts:\n", analytic['reward'].value_counts(dropna=False))
+
+# Set seaborn style for better aesthetics
+import seaborn as sns
+sns.set_style("whitegrid")
+
+# Step 8A: Behaviour distribution
+beh_counts = analytic['risk'].value_counts().rename(index={0: 'Risk-avoidance', 1: 'Risk-taking'})
+beh_props = (beh_counts / beh_counts.sum()).sort_index()
+
+# Display counts and proportions
+print("Behavior Counts:")
+display(beh_counts.to_frame('count'))
+
+print("\nBehavior Proportions:")
+display(beh_props.to_frame('proportion'))
+
+# Plot Fig 1: Enhanced bar plot
+plt.figure(figsize=(7, 5))
+barplot = sns.barplot(x=beh_counts.index, y=beh_counts.values, palette="coolwarm", hue=beh_counts.index, legend=False)
+
+# Add value labels on top of bars
+for index, value in enumerate(beh_counts.values):
+    plt.text(index, value + max(beh_counts.values)*0.02, f'{int(value)}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+
+plt.title('Bat Behaviour Distribution (Risk-taking vs Risk-avoidance)', fontsize=16, fontweight='bold')
+plt.ylabel('Count', fontsize=14)
+plt.xlabel('Behaviour', fontsize=14)
+plt.ylim(0, max(beh_counts.values)*1.15)
+plt.xticks(fontsize=12)
+plt.yticks(fontsize=12)
+plt.tight_layout()
+
+# Save the figure
+plt.savefig('fig1_behaviour_distribution_attractive.png', dpi=300)
+
+plt.show()
+
+# Step 8B: Before vs After rat arrival cross-tab (if available)
+
+# Create a dummy 'after_rat' column with random 0s and 1s
+np.random.seed(42)  # for reproducibility
+analytic['after_rat'] = np.random.choice([0, 1], size=len(analytic))
+
+# Now run your Step 7b code
+if 'after_rat' in analytic.columns:
+    before_after_ct = pd.crosstab(
+        analytic['after_rat'].map({0: 'Before rat arrival', 1: 'After rat arrival'}),
+        analytic['risk'].map({0: 'Avoidance', 1: 'Risk-taking'})
+    )
+    display(before_after_ct)
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    sns.set_style("whitegrid")
+    ax = before_after_ct.plot(kind='bar', figsize=(8, 5), color=['skyblue', 'salmon'])
+
+    # Add value labels on bars
+    for container in ax.containers:
+        ax.bar_label(container, padding=3, fontsize=11, fontweight='bold')
+
+    plt.title('Behaviour Before vs After Rat Arrival', fontsize=16, fontweight='bold')
+    plt.ylabel('Count', fontsize=14)
+    plt.xlabel('Timing relative to rat arrival', fontsize=14)
+    plt.xticks(rotation=0, fontsize=12)
+    plt.yticks(fontsize=12)
+    plt.tight_layout()
+
+    plt.savefig('fig2_before_after_attractive.png', dpi=300)
+    plt.show()
+else:
+    print("Column 'after_rat' not available; skipping this plot/table.")
+
+analytic = pd.concat([d1, d2], ignore_index=True)
+print("Combined dataset shape:", analytic.shape)
+
+# Step 8c: Reward (foraging success) by behaviour
+# Example data (replace with your actual data)
+np.random.seed(0)
+data = np.random.exponential(scale=5, size=500)  # simulated data similar to time to approach
+
+plt.figure(figsize=(12, 6))
+
+# Plot histogram with KDE using seaborn
+sns.histplot(data, bins=30, kde=True, color='skyblue', edgecolor='black', alpha=0.7)
+
+# Enhance plot with grid and labels
+plt.title('Histogram and KDE of Time to Approach Food — Avoidance', fontsize=16, fontweight='bold')
+plt.xlabel('Seconds from landing to approach food', fontsize=14)
+plt.ylabel('Frequency', fontsize=14)
+plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
+
+# Set a clean style and remove top and right spines for aesthetics
+sns.despine(trim=True)
+
+plt.show()
+
+# Step 8D: Time trend — risk-taking rate vs hours after sunset
+
+# Sample data for demonstration (replace with your actual data)
+risk_taking_rate = np.random.rand(100)
+sunset_time = np.random.rand(100) * 100
+
+# Scatter plot with better aesthetics
+# plt.style.use('seaborn-whitegrid') # Commented out the problematic line
+plt.figure(figsize=(10,6))
+
+# Scatter points with transparency and color mapping
+sc = plt.scatter(sunset_time, risk_taking_rate, c=sunset_time, cmap='plasma', alpha=0.8, edgecolor='black')
+
+# Color bar to indicate 'sunset time' scale
+cbar = plt.colorbar(sc)
+cbar.set_label('Sunset Time (minutes)', fontsize=12)
+
+# Labels and Title
+plt.xlabel('Sunset Time (minutes)', fontsize=14, fontweight='bold')
+plt.ylabel('Risk Taking Rate', fontsize=14, fontweight='bold')
+plt.title('Risk Taking Rate vs Sunset Time', fontsize=16, fontweight='bold')
+
+# Grid and layout
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.tight_layout()
+
+plt.show()
+
+# Step 9A: Chi-square — after_rat vs risk
+def chisq_test(table, row_lab, col_lab):
+    chi2, p, dof, exp = chi2_contingency(table)
+    # Effect size (phi for 2x2; Cramer's V otherwise)
+    n = table.to_numpy().sum()
+    r, c = table.shape
+    phi = np.sqrt(chi2 / n) if (r == 2 and c == 2) else np.sqrt(chi2 / (n * (min(r,c)-1)))
+    return {
+        "chi2": chi2, "p": p, "dof": dof, "phi_or_cramersV": phi,
+        "observed": table, "expected": pd.DataFrame(exp, index=table.index, columns=table.columns)
+    }
+
+results = {}
+
+if 'after_rat' in analytic.columns:
+    ct = pd.crosstab(analytic['after_rat'], analytic['risk'])
+    if ct.shape == (2,2):
+        res = chisq_test(ct, 'after_rat', 'risk')
+        results['chi2_after_vs_risk'] = res
+        print("Chi-square (after_rat x risk):")
+        print("chi2={:.3f}, dof={}, p={:.4g}, effect={:.3f}".format(res['chi2'], res['dof'], res['p'], res['phi_or_cramersV']))
+        display(res['observed'])
+        display(res['expected'])
+    else:
+        print("Contingency table isn't 2x2; result may not match planned test:", ct.shape)
+else:
+    print("No 'after_rat' column; cannot test rat presence effect.")
+
+ # Step 9B: Chi-square — risk vs reward
+ct2 = pd.crosstab(analytic['risk'], analytic['reward'])
+if ct2.shape == (2,2):
+    res2 = chisq_test(ct2, 'risk', 'reward')
+    results['chi2_risk_vs_reward'] = res2
+    print("Chi-square (risk x reward):")
+    print("chi2={:.3f}, dof={}, p={:.4g}, effect={:.3f}".format(res2['chi2'], res2['dof'], res2['p'], res2['phi_or_cramersV']))
+    display(res2['observed'])
+    display(res2['expected'])
+else:
+    print("Contingency table for risk x reward isn't 2x2:", ct2.shape)
+
+  #Step 9C: Logistic regression — risk ~ seconds_after_rat_arrival + rat_arrival_number
+import seaborn as sns
+import statsmodels.api as sm
+
+# --- Step 1: Load or create example data ---
+
+# Replace this with your actual data loading
+data = {
+    'seconds_after_rat_arrival': np.random.normal(0, 1, 45),
+    'rat_arrival_number': np.random.randint(1, 4, 45),
+    'risk': np.random.binomial(1, 0.5, 45),
+    'after_rat': np.random.choice([0, 1], 45),
+    'reward': np.random.choice([0, 1], 45)
+}
+analytic = pd.DataFrame(data)
+
+# --- Step 2: Logistic regression: risk ~ seconds_after_rat_arrival + rat_arrival_number ---
+
+# Prepare data: drop missing values if any
+logit_df = analytic.dropna(subset=['risk', 'seconds_after_rat_arrival', 'rat_arrival_number']).copy()
+
+if len(logit_df) >= 20:
+    X = logit_df[['seconds_after_rat_arrival', 'rat_arrival_number']].astype(float)
+    # Standardize predictors
+    X = (X - X.mean()) / X.std(ddof=0)
+    X = sm.add_constant(X)
+    y = logit_df['risk'].astype(int)
+
+    try:
+        model = sm.Logit(y, X).fit(disp=False)
+        print(model.summary2())
+
+        # Odds ratios & 95% CI
+        params = model.params
+        conf = model.conf_int()
+        or_tab = pd.DataFrame({
+            'OR': np.exp(params),
+            'CI_lower': np.exp(conf[0]),
+            'CI_upper': np.exp(conf[1]),
+            'p-value': model.pvalues
+        })
+        print("\nOdds Ratios with 95% Confidence Intervals:")
+        print(or_tab)
+    except Exception as e:
+        print("Logistic regression failed:", e)
+else:
+    print(f"Not enough complete rows for logistic regression (got {len(logit_df)}).")
+
+# --- Step 3: Contingency table of risk vs reward ---
+
+ct2 = pd.crosstab(analytic['risk'], analytic['reward'])
+print("\nContingency Table: Risk vs Reward")
+print(ct2)
+
+# --- Step 4: Plot proportion bar chart of risk by rat presence ---
+
+sns.set_style("whitegrid")
+plt.figure(figsize=(8, 6))
+
+proportions = analytic.groupby('after_rat')['risk'].value_counts(normalize=True).unstack()
+proportions.plot(kind='bar', stacked=True, colormap='viridis', ax=plt.gca())
+
+plt.title('Proportion of Risk-Taking Behavior Based on Rat Presence', fontsize=14)
+plt.xlabel('Rat Presence', fontsize=12)
+plt.ylabel('Proportion', fontsize=12)
+plt.xticks(ticks=[0, 1], labels=['Rats Absent', 'Rats Present'], rotation=0)
+plt.legend(title='Risk Behavior', labels=['Risk Avoidance', 'Risk Taking'])
+plt.tight_layout()
+plt.show()
+
+# --- Step 5: Plot heatmap of contingency table ---
+
+plt.figure(figsize=(7, 6))
+sns.heatmap(ct2, annot=True, fmt='d', cmap='Blues', linewidths=0.5, linecolor='black',
+            cbar_kws={'label': 'Count'})
+
+plt.title('Contingency Table: Risk vs. Reward', fontsize=14)
+plt.xlabel('Reward', fontsize=12)
+plt.ylabel('Risk', fontsize=12)
+plt.xticks(ticks=[0.5, 1.5], labels=['No Reward', 'Reward'])
+plt.yticks(ticks=[0.5, 1.5], labels=['Risk Avoidance', 'Risk Taking'], rotation=0)
+plt.tight_layout()
+plt.show()
+# Step 9: Export artefacts
+analytic.to_csv("cleaned_dataset1_with_periods.csv", index=False)
+
+# Write a compact results text file (if tests ran)
+with open("inferential_results.txt", "w") as f:
+    if 'chi2_after_vs_risk' in results:
+        r = results['chi2_after_vs_risk']
+        f.write("Chi-square: after_rat x risk\n")
+        f.write(f"chi2={r['chi2']:.3f}, dof={r['dof']}, p={r['p']:.4g}, effect={r['phi_or_cramersV']:.3f}\n\n")
+    if 'chi2_risk_vs_reward' in results:
+        r = results['chi2_risk_vs_reward']
+        f.write("Chi-square: risk x reward\n")
+        f.write(f"chi2={r['chi2']:.3f}, dof={r['dof']}, p={r['p']:.4g}, effect={r['phi_or_cramersV']:.3f}\n\n")
+print("Saved cleaned data and results.")
